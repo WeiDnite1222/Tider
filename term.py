@@ -6,8 +6,10 @@ import shutil
 import string
 import sys
 import traceback
+import keyboard
 
 from error import TiderMapFormatError
+from objectdefine import Entity, ControlDetector, Block
 
 tider_version = "paper-2"
 
@@ -31,6 +33,11 @@ class Map:
         self.description = "No Description"
 
         self.data = []
+        self.object_list = []
+        self.block_map = {}
+
+        self.control_thread = None
+
 
     def parser_map_data(self, full_map_data):
         found_map_header = False
@@ -71,8 +78,13 @@ class Map:
 
                 line_cleaned = line.replace(str(map_height)+":", "")
 
-                self.data.append(line_cleaned)
-
+                current_line = ""
+                for char in line_cleaned:
+                    if char == "~":
+                        current_line += " "
+                    else:
+                        current_line += char
+                self.data.append(current_line)
 
         if map_broken:
             return False
@@ -91,12 +103,10 @@ class Map:
     def parser_map_map_name(self, text):
         pattern = r'map_name = "(.*)"'
         match = re.match(pattern, text)
-
         if match:
-            self.name = match.group(0)
+            self.name = match.groups()[0]
         else:
             self.name = "Unnamed Map"
-
 
     def parser_map_description(self, text):
         pattern = r'map_description = "(.*)"'
@@ -107,6 +117,61 @@ class Map:
         else:
             self.description = "No Description"
 
+    def parser_map_object_list(self, object_data_list):
+        require_control_thread = False
+        require_control_thread_obj_list = []
+        for object_data in object_data_list:
+            lines = object_data.split("\n")
+            if object_data.count("!define_start:") != 1 and object_data.count("!define_end") != 1:
+                continue
+
+            object_id_line = lines[2]
+
+            match = re.match(r"id = (.*)", object_id_line)
+
+            if not match:
+                match = re.match(r"id = \"(.*)\"", object_id_line)
+
+            if not match:
+                continue
+
+            object_id = match.groups()[0].replace("\"", "")
+
+            line = lines.remove("!define_start:")
+            line = lines.remove("!define_end:")
+
+            if object_id.startswith("entity"):
+                entity = Entity(self.width, self.height)
+
+                for line in lines:
+                    for key in entity.parser_dict.keys():
+                        if line.startswith(key):
+                            func = entity.parser_dict[key]
+                            func(line)
+
+                self.object_list.append(entity)
+
+                if entity.can_control_by_user and not require_control_thread:
+                    require_control_thread = True
+                    require_control_thread_obj_list.append(entity)
+                elif entity.can_control_by_user:
+                    require_control_thread_obj_list.append(entity)
+            elif object_id.startswith("block"):
+                block = Block(self.width, self.height)
+                for line in lines:
+                    for key in block.parser_dict.keys():
+                        if line.startswith(key):
+                            func = block.parser_dict[key]
+                            func(line)
+
+                self.block_map[block.display_symbol] = block
+
+
+        if require_control_thread:
+            self.control_thread = ControlDetector(require_control_thread_obj_list[0])
+            self.control_thread.start()
+
+        return True
 
 def load_map(map_filepath):
     if not os.path.exists(map_filepath):
@@ -130,6 +195,10 @@ def load_map(map_filepath):
     full_map_data = ""
     found_map_herder = False
 
+    define_start = False
+    define_list = []
+    current_define = ""
+
     for line in map_data.splitlines():
         index += 1
 
@@ -143,8 +212,21 @@ def load_map(map_filepath):
         if line.startswith("!map_draw_start"):
             found_map_herder = True
             full_map_data += line + "\n"
+        elif line.startswith("!map_draw_end:"):
+            full_map_data += line + "\n"
+            found_map_herder = False
+        elif line.startswith("!define_start"):
+            define_start = True
+            current_define += line + "\n"
+        elif line.startswith("!define_end:"):
+            define_start = False
+            current_define += line
+            define_list.append(current_define)
+            current_define = ""
         elif found_map_herder:
             full_map_data += line + "\n"
+        elif define_start:
+            current_define += line + "\n"
         elif not line.startswith("!"):
             for parser_text in parser_dict:
                 if line.startswith(parser_text):
@@ -162,120 +244,81 @@ def load_map(map_filepath):
     if not status_code:
         raise TiderMapFormatError()
 
+    status_code = map.parser_map_object_list(define_list)
+
+    if not status_code:
+        raise TiderMapFormatError()
+
     return map
-
-def render_game(game_draw_width, game_draw_height, debug=False):
-    buffer = []
-    start_pos = 0,0
-    # -1是因為從0,0 開始畫
-    end_pos = game_draw_width-1, game_draw_height-1
-
-    # random_symbol = ["@", "#", "$", "%", "*", "~"]
-    # line += "{}".format(random.choice(random_symbol))*game_draw_width
-
-    class Line:
-        def __init__(self, start_pos, end_pos, display_symbol="#"):
-            self.start_pos = start_pos
-            self.end_pos = end_pos
-
-            self.type = "entity.line.tider"
-
-            # 計算斜率 (delta_x / delta_y)
-            dx = self.end_pos[0] - self.start_pos[0]
-            dy = self.end_pos[1] - self.start_pos[1]
-            if dy != 0:
-                self.y_offset = dx / dy  # 每增加 1 行，水平移動多少
-            else:
-                self.y_offset = 0
-
-            # 如果想允許一些誤差，可以用範圍
-            self.y_offset_allow_range = [self.y_offset]
-
-            self.display_symbol = display_symbol
-
-        def render_check(self, pixel_coord):
-            x_pos = pixel_coord[0]
-            y_pos = pixel_coord[1]
-
-            # 修正範圍檢查
-            if (self.start_pos[0] <= x_pos <= self.end_pos[0] and
-                    self.start_pos[1] <= y_pos <= self.end_pos[1]):
-                for offset in self.y_offset_allow_range:
-                    # 預期 x = x_start + offset*(y - y_start)
-                    expected_x = self.start_pos[0] + offset * (y_pos - self.start_pos[1])
-                    if x_pos == round(expected_x):
-                        return True
-
-            return False
-
-    line_a = Line(start_pos, end_pos)
-
-    entities = []
-    symbol_list = list(string.printable)
-
-    for i in range(1, 10):
-        a = random.randint(1, game_draw_width)
-        b = random.randint(1, game_draw_width)
-        pos = (a, b)
-        line = Line(pos, pos
-             , display_symbol=random.choice(symbol_list))
-        entities.append(line)
-
-    #V2
-    for y in range(0, game_draw_height):
-        current_line = ""
-
-        if debug:
-            index = str(y).zfill(3)
-            current_line += index
-
-        # "Rendering" entities starts here
-        for x in range(0, game_draw_width):
-            pixel_pos = x,y
-
-            used = False
-            for entity in entities:
-                result = entity.render_check(pixel_pos)
-                if result:
-                    current_line += entity.display_symbol
-                # if result and not used:
-                #
-                #     used = True
-                # elif result and used:
-                #     current_line = current_line[:-1] + entity.display_symbol
-
-            if not used:
-                current_line += " "
-
-        buffer.append(current_line)
-
-    return buffer
 
 
 def render_map(map_object: Map, debug=False):
-    buffer = []
-    for line, y in zip(map_object.data, range(0, len(map_object.data))):
-        current_line = ""
-        if debug:
-            index = str(y).zfill(3)
-            current_line += index + line
-        else:
-            current_line += line
+    multi_d_array = []  # multidimensional
+    data = map_object.data
+    uncrossable_coord_list = []
 
+    # First time render (Render space and block)
+    for line, y in zip(data, range(0, len(data))):
+        current_line_list = []
+
+        for char, x in zip(line, range(0, len(line))):
+            coord = (x, y)
+            used = False
+
+            current_block = map_object.block_map.get(char, None)
+            if current_block is not None:
+                current_line_list.append(current_block.display_symbol)
+                used = True
+                uncrossable_coord_list.append(coord)
+
+            if not used:
+               current_line_list.append(char)
+
+        multi_d_array.append(current_line_list)
+
+    # Second time render (Render entity)
+    new_array = []
+    for line, y in zip(multi_d_array, range(0, len(multi_d_array))):
+        current_line_list = []
+        for char, x in zip(line, range(0, len(line))):
+            used = False
+            coord = (x, y)
+
+            for entity in map_object.object_list:
+                if entity.current_cord == coord:
+                    current_line_list.append(entity.display_symbol)
+                    entity.update_uncrossable_cord_list(uncrossable_coord_list)
+                    used = True
+
+            if not used:
+                current_line_list.append(char)
+
+        new_array.append(current_line_list)
+
+
+    buffer = []
+    for line in new_array:
+        current_line = ""
+        for char in line:
+            current_line += char
         buffer.append(current_line)
 
     return buffer
 
 
 def main():
-    debug = False
+    debug = True
     fps_count = 0
-    freeze_fps = "Counting"
+    freeze_fps = "Counting > (If you fps stuck at \"Counting\", try restarting the game)"
     reset_time = datetime.datetime.now()
     current_map = None
     try:
         path = str(input("Enter the map path: "))
         current_map = load_map(path)
+        print("Map Info")
+        print("Name: {}".format(current_map.name))
+        print("Description: {}".format(current_map.description))
+        input("Press enter to start game...")
     except TiderMapFormatError:
         print("Map format is not correct.")
         sys.exit(1)
@@ -289,8 +332,8 @@ def main():
         wall_width = int(terminal_size[0] * 0.85)
         wall_height = int(terminal_size[1] * 0.85)
 
-        game_draw_width = wall_width - 0
-        game_draw_height = wall_height - 2
+        game_draw_width = current_map.width
+        game_draw_height = current_map.height
 
         if current_map is not None:
             game_draw_width = current_map.width
@@ -299,7 +342,7 @@ def main():
         min_height = current_map.height+9 if debug else current_map.height+5
         min_width = current_map.width+4 if debug else current_map.width
 
-        buffer.append("Max map size: {}x{} char as {}x{} cm".format(game_draw_width, game_draw_height,
+        buffer.append("Current map size: {}x{} char as {}x{} cm".format(game_draw_width, game_draw_height,
                                                                     int(game_draw_width / 10), int(game_draw_height / 10)))
 
 
@@ -315,11 +358,11 @@ def main():
                             break
                         else:
                             index_count += 1
-                buffer.append("###" + width_index_info)
+                buffer.append(width_index_info)
         print_width_index()
 
         # Print top wall
-        buffer.append("XXX"+"=" * wall_width if debug else ""+"=" * wall_width)
+        buffer.append(""+"=" * game_draw_width)
 
         # Game render place
         if terminal_size[1] < min_height:
@@ -328,13 +371,10 @@ def main():
             buffer.append(str(min_width))
             buffer.append("Stop rendering game because window size is too small.")
         else:
-            if current_map is not None:
-                buffer.extend(render_map(current_map, debug=debug))
-            else:
-                buffer.extend(render_game(game_draw_width, game_draw_height, debug=debug))
+            buffer.extend(render_map(current_map, debug=debug))
 
         # Print bottom wall
-        buffer.append("XXX"+"=" * wall_width if debug else ""+"=" * wall_width)
+        buffer.append(""+"=" * game_draw_width)
 
         print_width_index()
 
