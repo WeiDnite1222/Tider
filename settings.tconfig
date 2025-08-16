@@ -1,0 +1,4 @@
+#!im_tider_config
+
+default_map = "map.tm"
+player_name = "Kui"
